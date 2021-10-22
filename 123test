@@ -1,2 +1,180 @@
-我是一个兵
-爱戴老百姓
+# 一、基础环境准备
+
+## 版本信息
+
+- k8s：1.19.0
+- etcd：3.4.13
+- coredns：1.7.0
+- pause：3.2
+- calico：3.16.0
+- cfssl：1.2.0
+- kubernetes dashboard：2.0.3
+
+| 组件                   | 版本       | 发布时间 |
+| ---------------------- | ---------- | :------- |
+| kubernetes             | 1.19.0     |          |
+| etcd                   | 3.4.13     |          |
+| containerd             | 1.3.3      |          |
+| runc                   | 1.0.0-rc10 |          |
+| calico                 | 3.12.0     |          |
+| coredns                | 1.6.6      |          |
+| dashboard              | v2.0.0-rc4 |          |
+| k8s-prometheus-adapter | 0.5.0      |          |
+| prometheus-operator    | 0.35.0     |          |
+| prometheus             | 2.15.2     |          |
+| elasticsearch、kibana  | 7.2.0      |          |
+| cni-plugins            | 0.8.5      |          |
+| metrics-server         | 0.3.6      |          |
+
+## 机器安排
+
+| 主机名        | IP           |        角色及组件        |                         k8s 相关组件                         |
+| ------------- | ------------ | :----------------------: | :----------------------------------------------------------: |
+| centos7-nginx | 10.10.10.127 |      nginx 四层代理      |                            nginx                             |
+| centos7-a     | 10.10.10.128 | master,node,etcd,flannel | kube-apiserver kube-controller-manager kube-scheduler kubelet kube-proxy |
+| centos7-b     | 10.10.10.129 | master,node,etcd,flannel | kube-apiserver kube-controller-manager kube-scheduler kubelet kube-proxy |
+| centos7-c     | 10.10.10.130 | master,node,etcd,flannel | kube-apiserver kube-controller-manager kube-scheduler kubelet kube-proxy |
+| centos7-d     | 10.10.10.131 |       node,flannel       |                      kubelet kube-proxy                      |
+| centos7-e     | 10.10.10.132 |       node,flannel       |                      kubelet kube-proxy                      |
+
+## 集群规划：
+
+```javascript
+# 3个master节点的ip
+10.10.10.128
+10.10.10.129
+10.10.10.130
+# 2个worker节点的ip
+10.10.10.131
+10.10.10.132
+# 3个master节点的hostname
+k8s-m1
+k8s-m2
+k8s-m3
+# api-server的高可用虚拟ip（keepalived会用到，可自定义）
+10.10.10.100
+# keepalived用到的网卡接口名，一般是eth0，可执行ip a命令查看
+ens33
+# kubernetes服务ip网段（可自定义）
+10.255.0.0/16
+# kubernetes的api-server服务的ip，一般是cidr的第一个（可自定义）
+10.255.0.1
+# dns服务的ip地址，一般是cidr的第二个（可自定义）
+10.255.0.2
+# pod网段（可自定义）
+172.23.0.0/16
+# NodePort的取值范围（可自定义）
+8400-8900
+```
+
+## 基础环境准备
+
+**本例用centos7.4定制镜像自动化安装操作系统。(可以理解为最小化安装稍作优化)**
+
+**说明：如无特别说明，本文操作默认在10.10.10.128上操作**
+
+### 升级内核
+
+CentOS 7.x 系统自带的 3.10.x 内核存在一些 Bugs，导致运行的 Docker、Kubernetes 不稳定，例如：
+
+1. 高版本的 docker(1.13 以后) 启用了 3.10 kernel 实验支持的 kernel memory account 功能(无法关闭)，当节点压力大如频繁启动和停止容器时会导致 cgroup memory leak；
+2. 网络设备引用计数泄漏，会导致类似于报错："kernel:unregister_netdevice: waiting for eth0 to become free. Usage count = 1";
+
+解决方案如下：
+
+1. 升级内核到 4.4.X 以上；
+2. 或者，手动编译内核，disable CONFIG_MEMCG_KMEM 特性；
+3. 或者，安装修复了该问题的 Docker 18.09.1 及以上的版本。但由于 kubelet 也会设置 kmem（它 vendor 了 runc），所以需要重新编译 kubelet 并指定 GOFLAGS="-tags=nokmem"；
+
+```
+git clone --branch v1.14.1 --single-branch --depth 1 https://github.com/kubernetes/kubernetes
+cd kubernetes
+KUBE_GIT_VERSION=v1.14.1 ./build/run.sh make kubelet GOFLAGS="-tags=nokmem"
+```
+
+这里采用[升级内核](C:\Users\Administrator\Desktop\markdown\1、升级内核.md)的办法：
+
+### 生成免秘钥认证
+
+```
+$ ssh-keygen -t rsa
+$ ssh-copy-id 10.10.10.128
+$ ssh-copy-id 10.10.10.129
+$ ssh-copy-id 10.10.10.130
+$ ssh-copy-id 10.10.10.131
+$ ssh-copy-id 10.10.10.132
+```
+
+###  安装配置`ansible`用于批量操作
+
+```bash
+# yum -y install ansible
+
+# cat /etc/ansible/hosts
+[masters]
+10.10.10.128
+10.10.10.129
+10.10.10.130
+
+[nodes]
+10.10.10.131
+10.10.10.132
+
+[k8s]
+10.10.10.[128:132]
+
+# ansible k8s -m ping  测试生效             
+```
+
+### 设置主机名
+
+```
+# hostnamectl --static set-hostname k8s-m1
+# ansible 10.10.10.129 -m shell -a "hostnamectl --static set-hostname k8s-m2"
+# ansible 10.10.10.130 -m shell -a "hostnamectl --static set-hostname k8s-m3"
+# ansible 10.10.10.131 -m shell -a "hostnamectl --static set-hostname k8s-n1"
+# ansible 10.10.10.132 -m shell -a "hostnamectl --static set-hostname k8s-n2"
+```
+
+### 分发 hosts 文件统一解析
+
+```
+# cat /etc/hosts
+127.0.0.1   localhost localhost.localdomain localhost4 localhost4.localdomain4
+::1         localhost localhost.localdomain localhost6 localhost6.localdomain6
+
+10.10.10.128 k8s-m1
+10.10.10.129 k8s-m2
+10.10.10.130 k8s-m3
+10.10.10.131 k8s-n1
+10.10.10.132 k8s-n2
+```
+
+使用 ansible 批量执行
+
+```
+# ansible k8s -m copy -a "src=/etc/hosts dest=/etc/hosts"              （注意不同环境hosts文件的备份）
+```
+
+
+
+### 关闭防火墙 && selinux && swap分区
+
+使用 ansible 批量执行
+
+```
+# 关闭防火墙
+ansible k8s -m shell -a "systemctl stop firewalld &&  systemctl disable firewalld"
+
+# 关闭 selinux
+ansible k8s -m shell -a "setenforce  0  && sed -i 's#SELINUX=enforcing#SELINUX=permissive#g' /etc/selinux/config"
+
+# 关闭swap分区
+ansible k8s -m shell -a "swapoff -a && sysctl -w vm.swappiness=0 && sed -i '/ swap / s/^\(.*\)$/#\1/g' /etc/fstab"
+```
+
+提示：为什么需要禁用swap？当前的Qos策略都是假定主机不启用内存Swap。如果主机启用了Swap，那么Qos策略可能会失效。例如：两个Pod都刚好达到了内存Limits，由于内存Swap机制，它们还可以继续申请使用更多的内存。如果Swap空间不足，那么最终这两个Pod中的进程可能会被“杀掉”。
+
+目前Kubernetes和Docker尚不支持内存Swap空间的隔离机制。它的想法是将实例紧密包装到尽可能接近100％。 所有的部署应该与CPU /内存限制固定在一起。 所以如果调度程序发送一个pod到一台机器，它不应该使用交换。 另一方面是出于对性能的考虑。
+
+### 修改内核参数
